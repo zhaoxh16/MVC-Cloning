@@ -4,22 +4,21 @@ Image::Image() {
 
 }
 
-void Image::readImage(string source, string target) {
+void Image::readImage(string source, string target, Point offset) {
 	this->sourceImage = imread(source);
 	this->targetImage = imread(target);
+	this->offset = offset;
 }
 
 void Image::init() {
 	getContour();
 	triangulate();
 	computeMVC();
-	/*showMesh();*/
+	clone();
+	showMesh();
 }
 
 void Image::show() {
-	for (int i = 0; i < contour.size(); ++i) {
-		cout << contour[i] << endl;
-	}
 	imshow("contour", mask);
 	waitKey(0);
 }
@@ -33,9 +32,7 @@ void Image::getContour() {
 	vector<vector<Point>>contours;
 	vector<Vec4i> hierarchy;
 	Mat tmpImage;
-	GaussianBlur(mask, tmpImage, Size(3, 3), 0);
-	Canny(tmpImage, tmpImage, 100, 250);
-	findContours(tmpImage, contours, hierarchy, CV_RETR_EXTERNAL, CV_CHAIN_APPROX_NONE, Point());
+	findContours(mask, contours, hierarchy, CV_RETR_EXTERNAL, CV_CHAIN_APPROX_NONE, Point());
 	int index = 0;
 	int length = 0;
 	for (int i = 0; i < contours.size(); ++i) {
@@ -64,7 +61,7 @@ void Image::triangulate() {
 void Image::computeMVC() {
 	for (int i = 0; i < vertices.size(); ++i) {
 		vector<double> mvcVector;
-		Eigen::Vector3d pTarget(vertices[i].x, vertices[i].y, 0);
+		Eigen::Vector3d pTarget(vertices[i].x+eps, vertices[i].y+eps, 0);
 		double sum = 0;
 		for (int j = 0; j < contour.size(); ++j) {
 			Eigen::Vector3d pPre, pNow, pNext;
@@ -76,16 +73,23 @@ void Image::computeMVC() {
 			Eigen::Vector3d v0 = pPre - pTarget;
 			Eigen::Vector3d v1 = pNow - pTarget;
 			Eigen::Vector3d v2 = pNext - pTarget;
-			double a = acos(v0.dot(v1) / (sqrt(v0.dot(v0))*sqrt(v1.dot(v1))))/2.0;
-			double b = acos(v1.dot(v2) / (sqrt(v1.dot(v1))*sqrt(v2.dot(v2))))/2.0;
-			double tana = fabs(sin(a) / cos(a));
-			double tanb = fabs(sin(b) / cos(b));
-			double w = (tana + tanb) / (sqrt((pNow - pTarget).dot(pNow - pTarget)) + eps);
+			double cos2a = v0.dot(v1) / (sqrt(v0.dot(v0))*sqrt(v1.dot(v1)));
+			double cos2b = v1.dot(v2) / (sqrt(v1.dot(v1))*sqrt(v2.dot(v2)));
+			if (cos2a > 1.0)cos2a = 1.0;
+			if (cos2a < -1.0)cos2a = -1.0;
+			if (cos2b > 1.0) cos2b = 1.0;
+			if (cos2b < -1.0)cos2b = -1.0;
+			double a = fabs(acos(cos2a)/2.0);
+			double b = fabs(acos(cos2b)/2.0);
+			double tana = tan(a);
+			double tanb = tan(b);
+			double w = (tana + tanb) / (sqrt(v1.dot(v1)) + eps);
 			mvcVector.push_back(w);
 			sum += w;
 		}
-		for (int j = 0; j < mvcVector.size(); ++j)
+		for (int j = 0; j < mvcVector.size(); ++j) {
 			mvcVector[j] /= sum;
+		}
 		mvcMatrix.push_back(mvcVector);
 	}
 
@@ -172,5 +176,51 @@ void Image::showMesh() {
 		}
 	}
 	imshow("meshImage", meshImage);
+	waitKey(0);
+}
+
+void Image::clone() {
+	vector<Eigen::Vector3d> diff;
+	for (int i = 0; i < contour.size(); ++i) {
+		Vec3b tar = targetImage.at<Vec3b>(contour[i].y + offset.y, contour[i].x + offset.x);
+		Vec3b source = sourceImage.at<Vec3b>(contour[i].y, contour[i].x);
+		Eigen::Vector3d colorDiff((int)tar[0] - (int)source[0], (int)tar[1] - (int)source[1], (int)tar[2] - (int)source[2]);
+		diff.push_back(colorDiff);
+	}
+	cDiff = new Eigen::Vector3d*[sourceImage.rows];
+	for (int i = 0; i < sourceImage.rows; ++i) {
+		cDiff[i] = new Eigen::Vector3d[sourceImage.cols];
+		for (int j = 0; j < sourceImage.cols; ++j)
+			cDiff[i][j] = Eigen::Vector3d(0, 0, 0);
+	}
+
+	for (int i = 0; i < vertices.size(); ++i) {
+		Eigen::Vector3d colorDiff(0, 0, 0);
+		for (int k = 0; k < diff.size(); ++k) {
+			colorDiff += diff[k] * mvcMatrix[i][k];
+		}
+		cDiff[vertices[i].y][vertices[i].x] = colorDiff;
+	}
+
+	for (int i = 0; i < meshs.size(); ++i) {
+		for (int j = 0; j < meshs[i].insidePoints.size(); ++j) {
+			Eigen::Vector3d colorDiff(0, 0, 0);
+			for (int k = 0; k < 3; ++k) {
+				colorDiff += meshs[i].weight[j][k] * cDiff[meshs[i].vertices[k].y][meshs[i].vertices[k].x];
+			}
+			cDiff[meshs[i].insidePoints[j].y][meshs[i].insidePoints[j].x] = colorDiff;
+		}
+	}
+
+	for (int i = 0; i < sourceImage.rows; ++i) {
+		for (int j = 0; j < sourceImage.cols; ++j) {
+			Vec3b sImage = sourceImage.at<Vec3b>(i, j);
+			int pixel0 = max(0.0, min(255.0, cDiff[i][j][0] + (int)sImage[0]));
+			int pixel1 = max(0.0, min(255.0, cDiff[i][j][1] + (int)sImage[1]));
+			int pixel2 = max(0.0, min(255.0, cDiff[i][j][2] + (int)sImage[2]));
+			if (computed[i][j]) targetImage.at<Vec3b>(i + offset.y, j + offset.x) = Vec3b(pixel0,pixel1,pixel2);
+		}
+	}
+	imshow("target", targetImage);
 	waitKey(0);
 }
